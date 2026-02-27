@@ -23,7 +23,7 @@ class AutoQuantForCausalLM:
         
     @classmethod
     def from_pretrained(
-        self,
+        cls,
         model_path, 
         torch_dtype="auto",
         trust_remote_code=True,

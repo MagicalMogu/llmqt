@@ -1,0 +1,2 @@
+
+class Qwen3MOdelForCausalLM(BaseModelForCausalLM):
