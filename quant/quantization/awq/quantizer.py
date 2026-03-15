@@ -1,10 +1,22 @@
-from ast import Dict
+from ast import Dict, mod
 from os import name
+import tokenize
 from typing import List
 
 from quant.quantization.awq import scale
 import torch
+import torch.nn as nn
 from quant.quantization.base.quantizer import BaseQuantizer
+from quant.quantization.awq.awq_clib_utils import get_calib_dataset
+from quant.quantization.common_utils import (
+    # append_str_prefix,
+    # get_op_name,
+    # get_named_linears,
+    # set_op_by_name,
+    # exclude_layers_to_not_quantize,
+    # clear_memory,
+    get_best_device
+)
 
 class AwqQuantizer(BaseQuantizer):
     def __init__(
@@ -29,7 +41,7 @@ class AwqQuantizer(BaseQuantizer):
         max_chunk_memory=1024*1024*1024, # 校准时每个chunk的最大内存, 省显存小技巧
     )-> None:
         super(BaseQuantizer, self).__init__()
-        self.modelforCausalLM = modelforCausalLM
+        self.awq_model = modelforCausalLM
         self.model = model
         self.model_type = model_type
         self.tokenizer = tokenizer
@@ -57,7 +69,7 @@ class AwqQuantizer(BaseQuantizer):
         # 名字叫target_modules,不是self.modules, 会和basequantize里的self.modules冲突
         # self.inps 表示捕获到的第一个layer的输入
         # self.target_modules表示需要量化的所有层
-        self.target_modules, self.module_kwargs, self.inps = self.get_target_modules_and_kwargs(
+        self.target_modules, self.module_kwargs, self.inps = self.init_quant(
             n_samples=self.max_calib_samples, n_seq_len=self.max_calib_seq_len
         )
 
@@ -129,3 +141,92 @@ class AwqQuantizer(BaseQuantizer):
             # 原地量化, 没有新建一个量化后的模型, 直接把原模型的权重改了
             if not self.fake_quant:
                 self._quantize_weights(self.target_modules[i], named_linears, common_device)
+
+
+
+# 下面是init_quant函数, 主要是获取校准数据, 获取需要量化的层, 获取第一个decoder layer的输入
+    def init_quant(self, n_samples=128, n_seq_len=512):
+        modules = self.awq_model.get_model_layers(self.model)
+        samples = get_calib_dataset(
+            data = self.calib_data,
+            tokenizer = self.tokenizer,
+            n_samples = n_samples,
+            max_seq_len = n_seq_len,
+            split = "validation",
+        )
+        samples = torch.cat(samples, dim=0) # [n_samples, seq_len]
+
+        inps = []
+        layer_kwargs = {}
+
+        best_device = get_best_device()
+        modules[0] = modules[0].to(best_device)
+        self.awq_model.move_embed(self.model, best_device)
+
+        # 捕获decoder layer0的input
+        # 实际上是上一个模块的输出，我们做一个假前向传播，触发hook函数，捕获到这个输入
+        # 我们把layer0 包装成这个Catcher
+        # 因为大部分decoder的forward如下
+        # def forward(self, hidden_states, ...):
+        # hidden_states就是输入, 也就是我们要捕获的input，则为args[0]或者kwargs的第一个元素
+        # 不是百分百通用，但对很多 HuggingFace decoder 模型能工作。
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+                # 继承所有属性，防止触发attribute error
+                for name, value in module.__dict__.items():
+                    setattr(self, name, value)
+
+            def forward(self, *args, **kwargs):
+                if (len(args) > 0):
+                    hidden_stats = args[0]
+                    del args
+                else:
+                    first_key = list(kwargs.keys())[0]
+                    hidden_states = kwargs.pop(first_key)
+
+                inps.append(hidden_states)
+                layer_kwargs.update(kwargs)
+                raise ValueError("Catch the input of the first layer, stop forward process")
+
+        modules[0] = Catcher(modules[0])
+        # forward,捕获到inputs, 还有layer_kwargs
+        # 也就是decoder layer的forward里除了hidden_states以外的其他参数, 比如attention mask等
+        try:
+            self.model(samples.to(best_device))
+        except ValueError:
+            pass
+
+        print(inps)
+        # 还原
+        modules[0] = modules[0].module
+        # prepare_inputs_for_generation是transformers里生成文本时准备输入的函数
+        # 输入samples，根据当前的状态动态地准备好下一步生成文本需要的输入, 比如input_ids, attention_mask等 
+        # 把捕获到的inputs和layer_kwargs准备好, 以便后续量化过程中使用
+        # ep.prefill阶段，inputs如下
+        # inputs = {
+        # 'input_ids': initial_input 初始化的输入 [batch, seq_len]
+        # 'attention_mask': attention_mask, 初始mask
+        # 'use_cache': True 
+        # }
+        # model_inputs = model.prepare_inputs_for_generation(**inputs)
+        # 但是decode阶段，inputs如下
+        # inputs = {
+        # 'inputs_ids': new_token [batch, 1]
+        # 'past_key_values': past 上一轮的kv
+        # 'attention_mask': update mask扩展mask
+        # }
+        # 现在有的layer kwargs是不全的，只是layer0的一个切面，这个函数可以补全回
+        # 输入时期的完整状态
+        layer_kwargs = self.model.prepare_inputs_for_generation(samples, **layer_kwargs)
+        layer_kwargs.pop("input_ids")
+
+        del samples
+        # 去掉一维
+        # 省显存
+        inps = inps[0]
+        modules = [module.to("cpu") for module in modules]
+        self.awq_model.move_embed(self.model, "cpu")
+
+        return modules, layer_kwargs, inps
