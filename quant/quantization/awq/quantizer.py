@@ -1,5 +1,10 @@
 from ast import Dict, mod
+from collections import defaultdict
+from email.policy import default
+import functools
+import inspect
 from os import name
+import tqdm
 import tokenize
 from typing import List
 
@@ -230,3 +235,76 @@ class AwqQuantizer(BaseQuantizer):
         self.awq_model.move_embed(self.model, "cpu")
 
         return modules, layer_kwargs, inps
+
+    # 1 decoder layer 2 里面的linear layer，dict name:nn.module
+    def _get_input_feature(self, layer, named_linears):
+
+        # 在每个linear module上注册这个钩子，截获输入
+        def cache_input_hook(m, x, y, name, feat_dict):
+            x = x[0]
+            x = x.detach().cpu()
+            feat_dict[name].append(x) # {linear name : input act}
+        #增加对一些模型的兼容
+        if self.awq_model.model_type == "qwen3_moe":
+            named_linears = {
+                **named_linears,
+                "mlp": layer.mlp,
+            }
+        if self.awq_model.model_type == "llama4":
+            named_linears = {
+                **named_linears,
+                "mlp": layer.mlp,
+            }
+
+        input_feat = defaultdict(list)
+        handles = []
+        for name, module in named_linears.items():
+            handles.append(
+                module.register_forward_hook(
+                    functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
+                )
+            )
+
+        sanitized_kwargs = self._sanitize_kwargs(self.module_kwargs, layer)
+        try:
+            # init_quant 里获得的输入在这里派上用场
+            # 当前 layer 前向后，输出会成为下一个 layer 的输入
+            self.inps = self._module_forward(self.inps, layer, sanitized_kwargs)
+        finally:
+            # remove handle，别影响下一个 layer
+            for h in handles:
+                h.remove()
+        
+        # 主要用于moe的验证
+        # 一个feat_dict[name] 里存的是一个列表 [tensor1, tensor2, tensor3, ...]
+        # 一个linear可能会被调用多次的，tensor的形状是[batch,seq_len,in_features]
+        # 或者 [token, in_features]
+        # 
+        def cat_and_assert(k,v):
+            x = torch.cat(v, dim=0)
+            assert x.shape[0] != 0, (
+                f"Failed to collect input features for layer '{k}'. "
+                "Please check whether the target module was executed in the forward pass."
+            )
+            return x
+
+        input_feat = {k: cat_and_assert(k,v) for k,v in input_feat.items()}
+        return input_feat
+
+    
+    def _sanitize_kwargs(self, inputs_kwargs, module):
+        """
+        过滤掉目标模块的forward方法不支持的参数
+
+        """
+
+        module_signature = inspect.signature(module.forward)
+        sanitized_kwargs = {}
+        accepts_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in module_signature.parameters.values()
+        )
+        for key, value in inputs_kwargs.items():
+            if accepts_var_kwargs or key in module_signature.parameters:
+                sanitized_kwargs[key] = value
+        return sanitized_kwargs
