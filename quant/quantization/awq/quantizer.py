@@ -3,7 +3,12 @@ from collections import defaultdict
 from email.policy import default
 import functools
 import inspect
+import logging
 from os import name
+from tkinter import W
+from turtle import end_fill
+from xml.dom.minidom import Element
+from requests import get
 import tqdm
 import tokenize
 from typing import List
@@ -15,8 +20,8 @@ from quant.quantization.base.quantizer import BaseQuantizer
 from quant.quantization.awq.awq_clib_utils import get_calib_dataset
 from quant.quantization.common_utils import (
     # append_str_prefix,
-    # get_op_name,
-    # get_named_linears,
+    get_op_name,
+    get_named_linears,
     # set_op_by_name,
     # exclude_layers_to_not_quantize,
     # clear_memory,
@@ -119,10 +124,8 @@ class AwqQuantizer(BaseQuantizer):
                 self.target_modules[i], input_feat, self.module_kwargs
             )
             # 搜寻每个linear的best scale
-            # module_config里每个元素是一个dict, 包含该linear的输入特征维度等信息,
-            # 举例
-            # {'name': 'self_attn.q_proj', 'input_dim': 4096, 'output_dim': 4096, 'group_size': 128, 'dtype': torch.float16}
-
+            # module_config里每个元素是一个dict, 包含该linear的输入特征维度等信息
+            # 详细看函数内部
             scale_list = [
                 self._search_best_scale(self.target_modules[i], **layer)
                 for layer in module_config
@@ -308,3 +311,272 @@ class AwqQuantizer(BaseQuantizer):
             if accepts_var_kwargs or key in module_signature.parameters:
                 sanitized_kwargs[key] = value
         return sanitized_kwargs
+
+    def _module_forward(
+        self,
+        x: torch.Tensor,
+        module: nn.Module,
+        module_kwargs: dict,
+    ) -> torch.Tensor:
+        """
+        对任意子模块做一次前向，并统一返回 tensor 输出。
+
+        这里单独封装一个 helper，主要是为了解决两件事：
+        1. 有些模块一次性跑完整个 calibration batch 会占很多显存，所以支持按小批次拆开跑。
+        2. Hugging Face 里的模块 forward 有时返回 tuple，这里统一取第一个真正的 hidden states/output。
+        """
+
+        if self.n_parrallel_calib_sample is None:
+            # 显存足够时，直接把所有校准样本一次性跑完。
+            module_output = module(x, **module_kwargs)
+            if isinstance(module_output, tuple):
+                module_output = module_output[0]
+        else:
+            # 显存紧张时，把校准输入按 batch 维拆开。
+            # 每次只跑 n_parrallel_calib_sample 条，最后再沿 dim=0 拼回完整输出。
+            module_output = []
+            partitioned_inputs = torch.split(x, self.n_parrallel_calib_sample, dim=0)
+            for x_partial in partitioned_inputs:
+                partial_output = module(x_partial, **module_kwargs)
+                if isinstance(partial_output, tuple):
+                    partial_output = partial_output[0]
+
+                # 中间结果先挪到 CPU，避免所有 partial output 一直堆在 GPU 上。
+                module_output.append(partial_output.cpu())
+
+            module_output = torch.cat(module_output, dim=0)
+
+        return module_output
+
+    @torch.no_grad()
+    def _search_best_scale(
+        self,
+        module, # transformer decoder layer
+        prev_op,
+        layers: List[nn.Linear],
+        inp:torch.Tensor,
+        module2inspect=None, # 子模块
+        kwargs={},
+    ):
+        # 实际上只需要传入module，其他的是搜索子图里的信息，由get_layers_for_scaling返回的dict
+
+        if module2inspect is None:
+            assert len(layers) == 1
+            module2inspect = layers[0]
+        
+        if "use_cache" in kwargs:
+            kwargs.pop("use_cache")
+
+        # put X to device
+        inp = inp.to(next(module2inspect.parameters()).device)
+        # [step 1], 计算 w [out channel, in channel] 下，每group的weight均值
+        # 把要量化的层的权重拼在一起，方便计算, [o1, in] [o2,in] -> [o1+o2, in]
+        weight = torch.cat([layer.weight for layer in layers], dim=0)
+        org_shape = weight.shape
+        # [(o1+o2)*in//group_size, group_size]
+        weight = weight.view(-1, self.group_size)
+        # 量化时，哪个通道更敏感、权重分布更大，取决于权重幅值，不取决于它是正还是负。
+        # 此时被缩放为[0,1], 越接近1表示越接近该group里最大的权重
+        w_scale = weight.abs() / (weight.abs().amax(dim=1, keepdim=True) + 1e-6)
+        w_scale = w_scale.view(org_shape) # [o1+o2, in]
+        w_mean = w_scale.mean(dim=0)# [in]
+
+        # [step 2]: view成[bs*token, in], 再计算每列activation均值
+        inp_flat = inp.cpu().abs().view(-1, inp.shape[-1])
+        num_elements = inp_flat.shape[0]
+        num_channels = inp_flat.shape[1]
+        # multiply by 2 for fp32
+        element_size_bytes = inp_flat.element_size() * 2
+
+        chunk_size = int(self.max_chunk_memory // (element_size_bytes * num_channels))
+        chunk_size = min(chunk_size, num_elements)
+        chunk_size = max(chunk_size, 1)
+
+        x_sum = torch.zeros(num_channels, dtype=torch.float32)
+        for i in range(0, num_elements, chunk_size):
+            end = min(i + chunk_size, num_elements)
+            chunk_sum = inp_flat[i:end].to(torch.float32).sum(dim=0)
+            x_sum += chunk_sum
+        # [in], [bs, in chanels]的X shape下的每列的mean
+        x_mean = (x_sum / num_elements).to(inp.dtype)   
+
+        # [STEP3] compute output of module
+        # 拿一个基准输出fp16，后续要对比loss function来搜寻最好的scales
+        # 对于qkv是self attn, gate up down是mlp, 还有o_proj的情况，计算它们的输出
+        with torch.no_grad():
+            module_kwargs = self._sanitize_kwargs(kwargs, module2inspect)
+            fp16_output = self._module_forward(inp, module2inspect, module_kwargs)
+            fp16_output = fp16_output.clip(torch.finfo(torch.float16).min, torch.finfo(torch.float16).max)
+
+        # [STEP4] 搜寻scale
+        best_scales = self._compute_best_scales(
+            inp, w_mean, x_mean, module2inspect, layers, fp16_output, module_kwargs
+        )
+
+        return (
+            get_op_name(module, prev_op),
+            tuple([get_op_name(module, layer) for layer in layers]),
+            best_scales,
+        )
+
+    def _compute_best_scales(
+        self,
+        x: torch.Tensor,
+        w_mean: torch.Tensor,
+        x_mean: torch.Tensor,
+        module2inspect: nn.Module,
+        layers: List[nn.Linear],
+        fp16_output: torch.Tensor,
+        kwargs: dict={}
+    ):
+        """
+        Compute loss and select best scales for every inchannels
+        L(s) = || Q(W * s) (s^-1 * X) - W*X ||^2
+        Q(W*s) 表示对 W*s 进行量化, s是缩放比例
+        X是输入特征
+        W是权重 fp16
+        s per channel, 也就是每个输入通道一个缩放比例
+
+        用网格搜索去找最佳scale
+        """
+
+        n_grid = 20
+        # 搜索流程的核心是：
+        # 1. 保存当前 module2inspect 的原始 fp16 参数快照 org_sd
+        # 2. 枚举一系列 ratio，构造候选 scales
+        # 3. 把候选 scales 临时应用到 layers 上，重新前向
+        # 4. 比较候选输出与 fp16_output 的误差，留下误差最小的一组
+        # 5. 每轮结束后都用 org_sd 恢复参数，保证所有候选在同一基线比较
+        #
+        # 这里常见的参数快照写法：
+        # org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
+        # 它的作用不是保存结果，而是为了“回滚”：
+        # 网格搜索会反复试不同 scale；如果不恢复原始权重，前一轮的改动会污染下一轮。
+        #
+      
+        history = []
+        best_ratio = -1
+        best_scales = None
+        best_error = float("inf")
+
+        # 这个快照是为了每次试完 candidate scales 后都能恢复原始参数。
+        org_sd = {k: v.cpu() for k, v in module2inspect.state_dict().items()}
+
+        device = x.device
+        x_mean = x_mean.view(-1).to(device)
+        w_mean = w_mean.view(-1).to(device)
+
+        # x_mean 和 w_mean 都是 [in]，每个输入通道一个均值。
+        for ratio_idx in range(n_grid):
+            ratio = ratio_idx / n_grid
+            # AWQ 论文原始 proxy 更偏向 activation magnitude；
+            # duo_scaling 是对论文里 activation-only proxy 的工程增强版。
+            # 论文原始思路更接近只用 activation 的 magnitude x_mean 来刻画通道重要性；
+            # 开源实现里常加入 weight 统计 w_mean，形成同时参考 x/w 的 duo_scaling：
+            #     scales ~ x_mean^ratio / w_mean^(1-ratio)
+            #
+            # 这样做的好处：
+            # 1. 当某个通道 activation 很小、但权重很大时，只看 x_mean 容易把 scale 压得过小，导致权重W消失
+            # 2. 同时利用 w_mean 后，搜索空间更平滑，极端稀疏激活下更稳（ds和llama上有一些极度稀疏但非常重要的权重）
+            # 3. ratio 相当于在“更信 activation”与“更信 weight”之间做网格搜索
+            #    ratio 越大越偏向 x_mean，越小越偏向 w_mean
+            if self.duo_scaling:
+                scales = (x_mean.pow(ratio) / w_mean.pow(1 - ratio) + 1e-4).clamp(min=1e-4)
+            else:
+                scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+
+            # scales最后有一些triks
+            # 1 平衡scale的范围，避免出现最大值和最小值差距过大，到时候权重分布会很不均匀
+            # 2 保持数值稳定，在后续的矩阵乘会有数据溢出 消失
+            scales = scales / (scales.max() * scales.min()).sqrt()
+            scales = scales.view(1, -1).to(device)
+            # 极端case的处理，相当于不做awq
+            scales[torch.isinf(scales)] = 1
+            scales[torch.isnan(scales)] = 1
+
+            # 求loss function的一部分
+            # Q(W*s) * s^-1
+            for fc in layers:
+                fc.weight.mul_(scales)
+                fc.weight.data = (
+                    self.pseudo_quantize_tensor(fc.weight.data)[0] / scales
+                )
+            # Q(W*s) * s^-1 * X
+            # 对子模块跑一个前向,就可以求出实际output
+            int_w_output = self._module_forward(x, module2inspect, kwargs)
+            int_w_output = int_w_output.clip(torch.finfo(int_w_output.dtype).min, torch.finfo(int_w_output.dtype).max)
+
+            loss = self._compute_loss(fp16_output, int_w_output, device)
+
+            history.append(loss)
+            if loss < best_error:
+                best_error = loss
+                best_ratio = ratio
+                best_scales = scales.clone()
+            # 回滚
+            module2inspect.load_state_dict(org_sd, strict=False)
+
+        if best_ratio == -1:
+            logging.debug(history)
+            raise ValueError("Failed to find best scales during grid search.")
+        
+        assert torch.isnan(best_scales).sum() == 0, best_scales
+
+        return best_scales.detach().cpu()
+
+
+    def pseudo_quantize_tensor(self, weight: torch.Tensor):
+        if self.group_size > 0:
+            assert weight.shape[1] % self.group_size == 0, (
+                f"in_features ({weight.shape[1]}) must be divisible by "
+                f"group_size ({self.group_size})"
+            )
+            view = weight.view(weight.shape[0], -1, self.group_size)
+        else:
+            view = weight.view(weight.shape[0], 1, weight.shape[1])
+
+        if self.zero_point:
+            qmin, qmax = 0, 2 ** self.w_bits - 1
+            min_val = view.amin(dim=-1, keepdim=True)
+            max_val = view.amax(dim=-1, keepdim=True)
+            scales = (max_val - min_val).clamp(min=1e-6) / max(qmax - qmin, 1)
+            zeros = torch.round(qmin - min_val / scales).clamp(qmin, qmax)
+            q = torch.clamp(torch.round(view / scales + zeros), qmin, qmax)
+            dequant = (q - zeros) * scales
+        else:
+            qmax = 2 ** (self.w_bits - 1) - 1
+            min_scale = 1e-6
+            scales = view.abs().amax(dim=-1, keepdim=True).clamp(min=min_scale) / max(qmax, 1)
+            q = torch.clamp(torch.round(view / scales), -qmax - 1, qmax)
+            dequant = q * scales
+
+        return dequant.view_as(weight)
+
+    def _compute_loss(
+        self,
+        fp16_output: torch.Tensor,
+        int_w_output: torch.Tensor,
+        device: torch.device
+    ):
+        loss = 0.0
+        fp16_output_flat = fp16_output.view(-1)
+        int_w_output_flat = int_w_output.view(-1)
+        num_elements = fp16_output_flat.size(0)
+        element_size_bytes = fp16_output.element_size()
+
+        # 分 chunk 算误差，避免一次性把整段输出搬到高精度后占太多显存/内存。
+        chunk_size = self.max_chunk_memory // (element_size_bytes * 2)
+        chunk_size = min(chunk_size, num_elements)
+        chunk_size = max(chunk_size, 1)
+
+        fp16_chunks = torch.split(fp16_output_flat, chunk_size)
+        int_w_chunks = torch.split(int_w_output_flat, chunk_size)
+
+        for fp16_chunk, int_w_chunk in zip(fp16_chunks, int_w_chunks):
+            chunk_loss = (
+                fp16_chunk.to(device) - int_w_chunk.to(device)
+            ).float().pow(2).sum().item()
+            loss += chunk_loss
+
+        loss /= num_elements
+        return loss

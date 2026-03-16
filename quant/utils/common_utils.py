@@ -1,3 +1,4 @@
+from ast import Raise
 import gc
 import importlib
 
@@ -41,3 +42,8 @@ def exclude_layers_to_not_quantize(named_linear: dict, modules_to_not_convert: l
 
     return filter_layers
     
+def get_op_name(module, op):
+    for name, m in module.named_modules():
+        if m is op:
+            return name
+    raise ValueError("Operator not found in the module")
