@@ -23,7 +23,7 @@ from quant.quantization.common_utils import (
     get_op_name,
     get_named_linears,
     # set_op_by_name,
-    # exclude_layers_to_not_quantize,
+    exclude_layers_to_not_quantize,
     # clear_memory,
     get_best_device
 )
@@ -112,7 +112,7 @@ class AwqQuantizer(BaseQuantizer):
             # 'mlp.up_proj': Linear(in_features=4096, out_features=11008, bias=True), 
             # 'mlp.down_proj': Linear(in_features=11008, out_features=4096, bias=True)
             # 
-            named_linears = self.get_named_linear(self.target_modules[i])
+            named_linears = get_named_linears(self.target_modules[i])
             named_linears = exclude_layers_to_not_quantize(
                 named_linears, self.modules_not_convert
             )
@@ -497,6 +497,7 @@ class AwqQuantizer(BaseQuantizer):
             # 求loss function的一部分
             # Q(W*s) * s^-1
             for fc in layers:
+                # dot product
                 fc.weight.mul_(scales)
                 fc.weight.data = (
                     self.pseudo_quantize_tensor(fc.weight.data)[0] / scales
@@ -525,32 +526,31 @@ class AwqQuantizer(BaseQuantizer):
         return best_scales.detach().cpu()
 
 
-    def pseudo_quantize_tensor(self, weight: torch.Tensor):
+    def pseudo_quantize_tensor(self, w: torch.Tensor):
+        org_w_shape = w.shape # [5120, 5120]
+
         if self.group_size > 0:
-            assert weight.shape[1] % self.group_size == 0, (
-                f"in_features ({weight.shape[1]}) must be divisible by "
+            assert org_w_shape[-1] % self.group_size == 0, (
+                f"in_features ({org_w_shape[-1]}) must be divisible by "
                 f"group_size ({self.group_size})"
             )
-            view = weight.view(weight.shape[0], -1, self.group_size)
-        else:
-            view = weight.view(weight.shape[0], 1, weight.shape[1])
+            w = w.view(-1, self.group_size) # [5220*40, 128]
 
+        assert w.dim() == 2
+        assert torch.isnan(w).sum() == 0
+
+        # 1. 对称量化
+        # int4的公式
+        # scale = absmax / 2^4-1, zp = 0
+        # qx = clip(round(x/scale), -16, 15)
         if self.zero_point:
-            qmin, qmax = 0, 2 ** self.w_bits - 1
-            min_val = view.amin(dim=-1, keepdim=True)
-            max_val = view.amax(dim=-1, keepdim=True)
-            scales = (max_val - min_val).clamp(min=1e-6) / max(qmax - qmin, 1)
-            zeros = torch.round(qmin - min_val / scales).clamp(qmin, qmax)
-            q = torch.clamp(torch.round(view / scales + zeros), qmin, qmax)
-            dequant = (q - zeros) * scales
+        
         else:
-            qmax = 2 ** (self.w_bits - 1) - 1
-            min_scale = 1e-6
-            scales = view.abs().amax(dim=-1, keepdim=True).clamp(min=min_scale) / max(qmax, 1)
-            q = torch.clamp(torch.round(view / scales), -qmax - 1, qmax)
-            dequant = q * scales
+            max_val = w.abs().max(dim=0, keepdim=True)[0]
 
-        return dequant.view_as(weight)
+
+        
+         
 
     def _compute_loss(
         self,

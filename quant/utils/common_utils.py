@@ -18,7 +18,7 @@ def get_best_device():
         return "cuda:0"
     return "cpu"
 
-def get_named_linear(module):
+def get_named_linears(module):
     # 返回字典，找到所有linear层
     return {name: m for name,m in module.named_modules() if isinstance(m, nn.linear)}
 
