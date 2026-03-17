@@ -418,7 +418,7 @@ class AwqQuantizer(BaseQuantizer):
             tuple([get_op_name(module, layer) for layer in layers]),
             best_scales,
         )
-
+    # 返回值 scales->tensor([in]), 每个输入通道一个scale
     def _compute_best_scales(
         self,
         x: torch.Tensor,
@@ -539,15 +539,43 @@ class AwqQuantizer(BaseQuantizer):
         assert w.dim() == 2
         assert torch.isnan(w).sum() == 0
 
-        # 1. 对称量化
-        # int4的公式
-        # scale = absmax / 2^4-1, zp = 0
-        # qx = clip(round(x/scale), -16, 15)
-        if self.zero_point:
         
-        else:
-            max_val = w.abs().max(dim=0, keepdim=True)[0]
+        if self.zero_point:
+            # 1. 非对称量化
+             max_val = w.amax(dim=0, keepdim=True)
+             min_val = w.amin(dim=0, keepdim=True)
+             max_int = 2 ** self.w_bits - 1
+             min_int = 0
+             scales = (max_val - min_val).clamp(min=1e-5) / max_int
+             zeros = (-torch.roud(min_val / scales)).clamp(min=min_int, max=max_int)
+             w = (
+                 torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
+             ) * scales
+             zeros = zeros.view(org_w_shape[0], -1)
 
+        else:
+            # 2. 对称量化
+            # int4的公式
+            # scale = absmax / 2^4-1, zp = 0
+            # qx = clip(round(x/scale), -8, 7)
+            max_val = w.abs().amax(dim=0, keepdim=True).clamp(min=1e-5)
+            max_int = 2 ** (self.w_bits - 1) - 1
+            min_int = -2 ** (self.w_bits - 1)
+            # 实际会把值映射到 -7,7
+            scales = max_val / max_int
+            zeros = None
+            # fake quant 最后需要把scales乘回去，保持数值不变
+            # 会包含量化误差，但是数值意义不变
+            w = torch.clamp(torch.round(w / scales), min_int, max_int) * scales
+        
+        assert torch.isnan(w).sum() == 0
+        assert torch.isnan(scales).sum() == 0
+        # 
+        scales = scales.view(org_w_shape[0], -1)
+        # view需要内存连续，reshape会先尝试view，不行了就复制一份数据，保证内存连续
+        w = w.reshape(org_w_shape)
+
+        return w, scales, zeros
 
         
          
