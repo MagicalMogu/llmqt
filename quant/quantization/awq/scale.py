@@ -1,5 +1,7 @@
 
 
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 from quant.utils.common_utils import get_op_by_name, get_op_name
@@ -147,3 +149,20 @@ def apply_scale(module, scale_list, input_feat_dict=None):
         for layer in layers:
             layer.to("cpu")
         scales.to("cpu")
+
+@torch.no_grad()
+def apply_clip(module, clip_list: Tuple[str, torch.Tensor]):
+    best_device = next(module.parameters()).device
+
+    for name, max_val in clip_list:
+        layer: nn.Linear = get_op_by_name(module, name)
+        layer.to(best_device)
+        max_val = max_val.to(layer.weight.device)
+        org_shape = layer.weight.shape
+        # layer.weight: [out_channel,  in_channel]
+        # max_val: [out_channel, n_group, 1]
+        layer.weight.data = layer.weight.data.reshape(*max_val.shape[:2], -1)
+        layer.weight.data = torch.clamp(layer.weight.data, -max_val, max_val)
+        layer.weight.data = layer.weight.data.reshape(org_shape)
+
+        layer.to("cpu")

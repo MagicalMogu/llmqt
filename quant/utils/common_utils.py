@@ -47,3 +47,13 @@ def get_op_name(module, op):
         if m is op:
             return name
     raise ValueError("Operator not found in the module")
+
+
+def append_str_prefix(x, prefix: str):
+    if isinstance(x, str):
+        return prefix + x
+    if isinstance(x, tuple):
+        return tuple(append_str_prefix(y, prefix) for y in x)
+    if isinstance(x, list):
+        return [append_str_prefix(y, prefix) for y in x]
+    return x

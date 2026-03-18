@@ -8,6 +8,7 @@ from os import name
 from tkinter import W
 from turtle import end_fill
 from xml.dom.minidom import Element
+from click import clear
 from requests import get
 import tqdm
 import tokenize
@@ -17,9 +18,9 @@ from quant.quantization.awq import scale
 import torch
 import torch.nn as nn
 from quant.quantization.base.quantizer import BaseQuantizer
-from quant.quantization.awq.awq_clib_utils import get_calib_dataset
-from quant.quantization.common_utils import (
-    # append_str_prefix,
+from quant.utils.awq_clib_utils import get_calib_dataset
+from quant.utils.common_utils import (
+    append_str_prefix,
     get_op_name,
     get_named_linears,
     # set_op_by_name,
@@ -131,7 +132,7 @@ class AwqQuantizer(BaseQuantizer):
                 for layer in module_config
             ]
             # 把搜到的scale应用到第i个decoder layer的每个linear上
-            apply_scale(
+            self.apply_scale(
                 self.target_modules[i], scale_list, input_feat, common_device, self.module_kwargs
             )
 
@@ -148,7 +149,7 @@ class AwqQuantizer(BaseQuantizer):
             # fp16->int4
             # 原地量化, 没有新建一个量化后的模型, 直接把原模型的权重改了
             if not self.fake_quant:
-                self._quantize_weights(self.target_modules[i], named_linears, common_device)
+                self._apply_quant(self.target_modules[i], named_linears, common_device)
 
 
 
@@ -418,6 +419,31 @@ class AwqQuantizer(BaseQuantizer):
             tuple([get_op_name(module, layer) for layer in layers]),
             best_scales,
         )
+    
+    @torch.no_grad()
+    def _search_best_clip(
+        self, 
+        layer: nn.Module, 
+        named_linears: dict, 
+        input_feat: dict, 
+        common_device: torch.device
+    ):
+        # clip_list = [(op_name, best_clip_value), ...]
+        clip_list = []
+        avoid_clipping = ["q_", "k_", "query", "key", "Wqkv"]
+
+        for name in named_linears:
+            if any([_ in name for _ in avoid_clipping]):
+                continue
+            named_linears[name].to(common_device)
+            max_val = self._compute_best_clip(
+                named_linears[name].weight, input_feat[name]
+            )
+            clip_list.append((name, max_val))
+            named_linears[name].to("cpu")
+        return clip_list
+
+
     # 返回值 scales->tensor([in]), 每个输入通道一个scale
     def _compute_best_scales(
         self,
@@ -525,6 +551,92 @@ class AwqQuantizer(BaseQuantizer):
 
         return best_scales.detach().cpu()
 
+    def _compute_best_clip(
+            self, 
+            weight: torch.Tensor, 
+            inp: torch.Tensor,
+            n_grid=20,
+            max_shrink=0.5,
+            n_samples_token=512) -> torch.Tensor:
+        """
+        返回tensor shape [out_channel, n_group, 1], 每个group一个clip值
+        搜寻最佳clip值的流程和搜寻最佳scale类似,也是枚举一系列候选clip值
+        应用到权重上 前向计算输出 与fp16输出比较误差 留下误差最小的那个clip值。
+        但是这里不是按照输入通道来搜寻 而是分为group来搜寻
+        和后面的group-wise量化配合
+        """
+        assert weight.dim() == 2
+        org_w_shape = weight.shape
+
+        # group-wise quantization: [oc, ic] -> [oc, 1, n_group, group_size]
+        group_size = self.group_size if self.group_size > 0 else org_w_shape[1]
+        assert org_w_shape[1] % group_size == 0, (
+            f"in_features ({org_w_shape[1]}) must be divisible by group_size ({group_size})"
+        )
+
+        # input activation: [bs, seq, ic] or [token, ic] -> [1, n_token, n_group, group_size]
+        inp = inp.view(-1, inp.shape[-1])
+        inp = inp.reshape(1, inp.shape[0], -1, group_size)
+
+        # sample tokens uniformly to reduce search memory/time cost
+        step_size = max(1, inp.shape[1] // n_samples_token)
+        inp = inp[:, ::step_size]
+
+        w = weight.reshape(org_w_shape[0], 1, -1, group_size)
+
+        # process output channels by chunks to avoid OOM
+        oc_batch_size = 256 if org_w_shape[0] % 256 == 0 else 64
+        assert org_w_shape[0] % oc_batch_size == 0, (
+            f"out_channels ({org_w_shape[0]}) must be divisible by oc_batch_size ({oc_batch_size})"
+        )
+
+        w_all = w
+        best_max_val_all = []
+
+        for oc_idx in range(org_w_shape[0] // oc_batch_size):
+            # 256 out channels per group
+            w_chunk = w_all[oc_idx * oc_batch_size : (oc_idx + 1) * oc_batch_size]
+            # [oc_batch_size, 1, n_group, group_size]
+            # 变成 [oc_batch_size, 1, n_group, 1] 的形式，表示每个group的clip值
+            org_max_val = w_chunk.abs().amax(dim=-1, keepdim=True)
+            best_max_val = org_max_val.clone()
+
+            min_err = torch.full_like(org_max_val, float("inf"))
+
+            inp_chunk = inp.to(w_chunk.device)
+            # inp_chunk [1, n_token, n_group, group_size]
+            # w_chunk [oc_batch_size, 1, n_group, group_size] ->
+            # -> [oc_batch_size, n_token, n_group]
+            # 本质是分块分组之后的矩阵乘法
+            # 求这个group的原始输出，作为后续搜索clip值的基准
+            org_out = (inp_chunk * w_chunk).sum(dim=-1)
+
+            # try progressively smaller clipping ranges
+            for grid_idx in range(int(max_shrink * n_grid)):
+                shrink_ratio = 1 - (grid_idx / n_grid)
+                max_val = org_max_val * shrink_ratio
+                min_val = -max_val
+
+                clipped_w = torch.clamp(w_chunk, min_val, max_val)
+                q_w = self.pseudo_quantize_tensor(clipped_w)[0]
+
+                cur_out = (inp_chunk * q_w).sum(dim=-1)
+                # average over sampled tokens -> per-(oc, group) error
+                cur_err = (cur_out - org_out).pow(2).mean(dim=1).view_as(min_err)
+                del clipped_w
+                del cur_out
+                better = cur_err < min_err
+                min_err[better] = cur_err[better]
+                best_max_val[better] = max_val[better]
+
+            best_max_val_all.append(best_max_val)
+
+        best_max_val = torch.cat(best_max_val_all, dim=0)
+        clear_memory(inp_chunk)
+        clear_memory(org_out)
+        # [out_channel, n_group, 1]
+        return best_max_val.squeeze(1)
+
 
     def pseudo_quantize_tensor(self, w: torch.Tensor):
         org_w_shape = w.shape # [5120, 5120]
@@ -577,8 +689,6 @@ class AwqQuantizer(BaseQuantizer):
 
         return w, scales, zeros
 
-        
-         
 
     def _compute_loss(
         self,
@@ -608,3 +718,11 @@ class AwqQuantizer(BaseQuantizer):
 
         loss /= num_elements
         return loss
+
+    def _apply_quant(
+            self,
+            layer: nn.Module,
+            named_linears: dict,
+            common_device: torch.device
+    ):
+        
