@@ -23,11 +23,12 @@ from quant.utils.common_utils import (
     append_str_prefix,
     get_op_name,
     get_named_linears,
-    # set_op_by_name,
+    set_op_by_name,
     exclude_layers_to_not_quantize,
-    # clear_memory,
+    clear_memory,
     get_best_device
 )
+from quant.nn_models.modules.linear import get_concrete_linear_module
 
 class AwqQuantizer(BaseQuantizer):
     def __init__(
@@ -132,17 +133,15 @@ class AwqQuantizer(BaseQuantizer):
                 for layer in module_config
             ]
             # 把搜到的scale应用到第i个decoder layer的每个linear上
-            self.apply_scale(
-                self.target_modules[i], scale_list, input_feat, common_device, self.module_kwargs
-            )
+            scale.apply_scale(self.target_modules[i], scale_list, input_feat)
 
             if self.apply_clip:
                 clip_list = self._search_best_clip(
-                    self.target_modules[i], named_linears, input_feat, common_device, self.module_kwargs
+                    self.target_modules[i], named_linears, input_feat, common_device
                 )
-                self.apply_clip(self.target_modules[i], clip_list, input_feat, common_device, self.module_kwargs)
+                scale.apply_clip(self.target_modules[i], clip_list)
                 clip_list = append_str_prefix(
-                    clip_list, get_op_name(self.model, self.target_modules[i])
+                    clip_list, get_op_name(self.model, self.target_modules[i]) + "."
                 )
             
             # 真正量化的地方，在这之前，上面的weight都是fp16
@@ -722,7 +721,48 @@ class AwqQuantizer(BaseQuantizer):
     def _apply_quant(
             self,
             layer: nn.Module,
-            named_linears: dict,
+            named_linears: Dict[str, nn.Linear] ,
             common_device: torch.device
     ):
-        
+        # 开始做真正的量化
+        # 一般的quant有四步
+        # fp16 to int4 quantize
+        # calibration
+        # dynamic / static quant
+        # save
+        # 但是awq的核心是scales的计算和apply, 2 3这里不需要。
+
+        for name, linear_layer in named_linears.items():
+            # q k v o up down gate
+            print(f"[INFO] Quantizing layer {name}...")
+
+            linear_layer = linear_layer.to(common_device).half()
+            # 主要是为了拿到scales和zeros，其实pseudo没必要做
+            # 1. 拿到scales zeros
+            linear_layer.weight.data, scales, zeros = self.pseudo_quantize_tensor(
+                linear_layer.weight.data
+            )
+
+            # 需要转置成 [n_group, out_channel]，和大多数量化线性层打包格式对齐
+            # shape都是 [out_channel, in_channel // group_size]
+            scales = scales.t().contiguous()
+            if zeros is not None:
+                zeros = zeros.t().contiguous()
+
+            # 基于scales 和 zeros 创建quntized linear 
+            q_linear_module = get_concrete_linear_module(self.quant_method)
+            # quantized linear，真正的量化
+            q_linear = q_linear_module.from_linear(
+                linear=linear_layer,
+                w_bit=self.w_bits,
+                group_size=self.group_size,
+                init_only=False,
+                scales=scales,
+                zeros=zeros,
+            )
+
+            linear_layer.cpu()
+            q_linear.to(next(layer.parameters()).device)
+            # 3 把量化后的q_linear替换掉原来的linear_layer
+            set_op_by_name(layer, name, q_linear)
+            clear_memory(scales, zeros, q_linear)

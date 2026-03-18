@@ -1,7 +1,6 @@
-from ast import Raise
 import gc
-import importlib
 
+import torch
 import torch.nn as nn
 
 
@@ -20,7 +19,7 @@ def get_best_device():
 
 def get_named_linears(module):
     # 返回字典，找到所有linear层
-    return {name: m for name,m in module.named_modules() if isinstance(m, nn.linear)}
+    return {name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)}
 
 # 典型的不量化层 ['lm_head']
 def exclude_layers_to_not_quantize(named_linear: dict, modules_to_not_convert: list[str]):
@@ -47,6 +46,40 @@ def get_op_name(module, op):
         if m is op:
             return name
     raise ValueError("Operator not found in the module")
+
+
+def get_op_by_name(module, op_name: str):
+    if op_name == "":
+        return module
+    current = module
+    for part in op_name.split("."):
+        current = getattr(current, part)
+    return current
+
+
+def set_op_by_name(module, op_name: str, new_op):
+    levels = op_name.split(".")
+    if len(levels) > 1:
+        mod_ = module
+        for idx in range(len(levels) - 1):
+            if levels[idx].isdigit():
+                mod_ = mod_[int(levels[idx])]
+            else:
+                mod_ = getattr(mod_, levels[idx])
+        setattr(mod_, levels[-1], new_op)
+    else:
+        setattr(module, op_name, new_op)
+
+
+def clear_memory(*objs):
+    for obj in objs:
+        try:
+            del obj
+        except Exception:
+            pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def append_str_prefix(x, prefix: str):

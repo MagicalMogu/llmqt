@@ -1,3 +1,5 @@
+import json
+import os
 import torch
 from torch import nn
 import transformers
@@ -102,8 +104,58 @@ class BaseModelForCausalLM(nn.Module):
         self.quantizer.quantize()
         self.isquantized = True
 
-    def save_quantized(self, save_directory):
-        save_torch_state_dict(
-            state_dict=self.model.state_dict(), 
-            save_directory=save_directory
+    def save_quantized(
+        self,
+        save_directory,
+        safetensors=True,
+        shard_size="5GB",
+    ):
+        os.makedirs(save_directory, exist_ok=True)
+
+        class EmptyModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, x):
+                return x
+
+        # 先保存 config/tokenizer 相关文件，避免立刻把完整权重再写一遍
+        if self.quant_config is not None:
+            self.model.config.quantization_config = self.quant_config.to_transformer_dict()
+        if getattr(self.model, "generation_config", None) is not None:
+            self.model.generation_config.do_sample = True
+
+        self.model.save_pretrained(
+            save_directory,
+            state_dict=EmptyModule().state_dict(),
+            safe_serialization=safetensors,
         )
+
+        # 删除 save_pretrained 生成的空权重文件，稍后用 huggingface_hub 的分片保存真实权重
+        default_paths = [
+            os.path.join(save_directory, "model.safetensors"),
+            os.path.join(save_directory, "pytorch_model.bin"),
+        ]
+        for path in default_paths:
+            if os.path.exists(path):
+                os.remove(path)
+
+        save_torch_state_dict(
+            state_dict=self.model.state_dict(),
+            save_directory=save_directory,
+            max_shard_size=shard_size,
+            safe_serialization=safetensors,
+            force_contiguous=True,
+            shared_tensors_to_discard=getattr(self.model, "_tied_weights_keys", None),
+        )
+
+        # 额外落地一份量化配置，方便 runtime 直接读取
+        if self.quant_config is not None:
+            quant_cfg_path = os.path.join(save_directory, self.quant_config.config_file_name)
+            with open(quant_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"quantization_config": self.quant_config.to_transformer_dict()},
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )

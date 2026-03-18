@@ -1,0 +1,17 @@
+from .linear_base import LinearBase
+from .linear_awq import AWQLinear_GEMM
+# from .linear_sq import SqW8A8BBF160BF16Linear
+# from .linear_fp8 import FP8DynamicLinear, FP8StaticLinear
+
+
+method_to_linear = {
+    "awq": AWQLinear_GEMM,
+    # "sq": SqW8A8BBF160BF16Linear,
+    # "fp8_static_quant": FP8StaticLinear,   # per tensor
+    # "fp8_dynamic_quant": FP8DynamicLinear, # per tensor
+    # # TODO: support more grained quantization
+}
+
+
+def get_concrete_linear_module(quant_method):
+    return method_to_linear[quant_method]
