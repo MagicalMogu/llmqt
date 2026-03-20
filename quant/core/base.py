@@ -6,6 +6,7 @@ import transformers
 from transformers import PretrainedModel, PretrainedConfig, AutoConfig
 from huggingface_hub import snapshot_download, save_torch_state_dict
 from .config import QuantConfig
+from quant.quantization import get_concrete_quantizer_cls
 
 TRANSFORMERS_AUTO_MAPPING_DICT = {
     "qwen2": "AutoModelForCausalLM",

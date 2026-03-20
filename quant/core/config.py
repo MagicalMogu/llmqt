@@ -25,6 +25,13 @@ class QuantConfig:
     per_tensor_quant: bool = field(default=False) # 是否使用逐张量量化
     kv_cache_quant_layers: list = field(default_factory=list) # 需要量化kv cache的层列表，格式为["layer.0", "layer.1", ...]
 
+    @staticmethod
+    def _normalize_quant_config_dict(quant_config: Dict) -> Dict:
+        normalized = dict(quant_config)
+        if "quant_method" in normalized and "quant_methon" not in normalized:
+            normalized["quant_methon"] = normalized.pop("quant_method")
+        return normalized
+
     @classmethod
     def from_pretrained(cls, save_dir, **kwargs):
         config_path = os.path.join(save_dir, cls.config_file_name)
@@ -35,13 +42,23 @@ class QuantConfig:
         
         if quant_config is None:
             return cls()
-        return cls(**quant_config)
+        return cls(**cls._normalize_quant_config_dict(quant_config))
     
     @classmethod
     def from_dict(cls, quant_config: Dict={}):
         if not quant_config:
             return cls()
-        return cls(**quant_config)
+        return cls(**cls._normalize_quant_config_dict(quant_config))
+
+    @property
+    def quant_method(self) -> str:
+        # 兼容调用侧使用更自然的 quant_method 命名；
+        # 先不改底层字段名，避免影响现有序列化格式和已有代码。
+        return self.quant_methon
+
+    @quant_method.setter
+    def quant_method(self, value: str) -> None:
+        self.quant_methon = value
       
     def to_transformer_dict(self):
         return {
