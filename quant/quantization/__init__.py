@@ -7,7 +7,7 @@ method_to_quantizer: dict[str, type[BaseQuantizer]] = {
     "awq": AwqQuantizer,
     "sq": SqQuantizer,
     "fp8_dynamic_quant": Fp8Quantizer,
-    "fp8_static_quant": Fp8Quantizer,
+    "fp8_static_quant": Fp8Quantizer, 
 }
 
 
