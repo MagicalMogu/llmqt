@@ -240,4 +240,29 @@ class Fp8Quantizer(BaseQuantizer):
             )
             replace_module(self.model, name, static_proj)
             del quantizer
+        # 4. 量化 kv cache
+        # store kv cache quant scale in the parent attention module as `k_scale` and `v_scale`
+        if quant_config.kv_cache_quant_layers:
+            # Assumes that list is ordered such that [layer0.k_proj, layer0.v_proj, layer1.k_proj, layer1.v_proj, ...]
+            # so we make a list of tuples [(layer0.k_proj, layer0.v_proj), (layer1.k_proj, layer1.v_proj), ...]
+            kv_proj_pairs = zip(*[iter(quant_config.kv_cache_quant_layers)] * 2)
+            
+            for k_proj_name, v_proj_name in kv_proj_pairs:
+                parent_module_name = ".".join(k_proj_name.split(".")[:-1])
+                assert parent_module_name == ".".join(v_proj_name.split(".")[:-1])
+                parent_module = dict(self.model.named_modules())[parent_module_name]
+
+                k_proj = dict(self.model.named_modules())[k_proj_name]
+                v_proj = dict(self.model.named_modules())[v_proj_name]
+                # !! 核心: 量化v在于把kv cache scale保存到k proj和v proj的parent module的属性中
+                parent_module.k_scale = torch.nn.Parameter(
+                    k_proj.output_scale, requires_grad=False
+                )
+                parent_module.v_scale = torch.nn.Parameter(
+                    v_proj.output_scale, requires_grad=False
+                )
+
+                # Remove output_scale from k_proj and v_proj
+                k_proj.output_scale = None
+                v_proj.output_scale = None
         clear_memory()

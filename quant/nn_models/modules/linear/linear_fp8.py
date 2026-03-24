@@ -24,10 +24,10 @@ def per_tensor_quantize(tensor: torch.Tensor):
     return qweight, scale
 
 
-def static_per_tensor_quantize(w: torch.Tensor, scale):
-    scale = torch.as_tensor(scale, device=w.device, dtype=torch.float32)
-    fp8_weight = (w / scale).to(torch.float8_e4m3fn)
-    return fp8_weight
+def static_per_tensor_quantize(tensor: torch.Tensor, static_scale: float) -> torch.Tensor:
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    qweight = (tensor / static_scale).clamp(min=finfo.min, max=finfo.max)
+    return qweight.to(torch.float8_e4m3fn)
 
 
 def per_channel_quantize(w: torch.Tensor):
@@ -250,3 +250,122 @@ class FP8StaticLinearQuantizer(torch.nn.Module):
             self.output_scale = output_scale
             output = qoutput.to(output.dtype) * output_scale
         return output  # fp16
+
+
+class FP8StaticLinear(LinearBase):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias: bool,
+        dev="cuda:0",
+        dtype=torch.bfloat16,
+        qdtype=torch.float8_e4m3fn,
+        per_tensor=True,  # only enable static quant when per tensor
+        quantize_output=False,
+    ):
+        super().__init__()
+        self.per_tensor = per_tensor
+        self.qdtype = qdtype
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = torch.nn.Parameter(
+            torch.randn(
+                (self.out_features, self.in_features),
+                dtype=dtype,
+                device=dev,
+                requires_grad=False,
+            )
+        )
+        if self.per_tensor:
+            self.weight_scale = torch.nn.Parameter(
+                torch.randn(
+                    (1,), dtype=torch.float32, device=dev, requires_grad=False
+                )
+            )
+        else:  # never go here，暂时没去实现weight的 per channel
+            self.weight_scale = torch.nn.Parameter(
+                torch.randn(
+                    (self.out_features, 1),
+                    dtype=torch.float32,
+                    device=dev,
+                    requires_grad=False,
+                )
+            )
+        if bias:
+            self.bias = torch.nn.Parameter(
+                torch.zeros(
+                    (self.out_features,),
+                    dtype=dtype,
+                    requires_grad=False,
+                    device=dev,
+                )
+            )
+        else:
+            self.bias = None
+
+        # static quant only support per tensor act
+        # 对于activation，静态方法只能做per tensor
+        self.input_scale = torch.nn.Parameter(
+            torch.randn((1,), dtype=torch.float32, device=dev, requires_grad=False)
+        )
+        self.quantize_output = quantize_output
+        self.output_scale = torch.nn.Parameter(
+            torch.randn((1,), dtype=torch.float32, device=dev, requires_grad=False)
+        )
+
+    @classmethod
+    def from_linear(
+        cls,
+        in_features,
+        out_features,
+        fp8_weight,
+        weight_scales,
+        bias,
+        input_scale=None,
+        output_scale=None,
+        group_size=0,
+        quantize_output=False,
+    ):
+        assert (
+            group_size == 0
+        ), "not support group wise fp8 quant yet! pls set group_size = 0"
+        fp8_static_linear = cls(
+            in_features,
+            out_features,
+            bias is not None,
+            per_tensor=True,
+            quantize_output=quantize_output,
+        )
+
+        if bias is not None:
+            fp8_static_linear.bias.data = bias.clone()
+        if True:  # fp8_static_linear.per_tensor always true
+            fp8_static_linear.weight_scale.data = torch.tensor(
+                weight_scales, device=fp8_weight.device
+            )
+        fp8_static_linear.weight.data = fp8_weight  # [out, in] row major
+        # unsqueeze to make it (1,) for broadcasting, since it's per tensor scalea
+        fp8_static_linear.input_scale.data = input_scale.unsqueeze(0) 
+        if quantize_output:
+            fp8_static_linear.output_scale.data = output_scale.unsqueeze(0)
+        return fp8_static_linear
+
+    def forward(self, x):
+        # scale is known in advance, so naming static
+        qinput = static_per_tensor_quantize(x, self.input_scale)
+        weight = self.weight.to(self.qdtype)
+        output = fp8_gemm(
+            A=qinput,
+            A_scale=self.input_scale,
+            B=weight,
+            B_scale=self.weight_scale,
+            bias=self.bias,
+            out_dtype=x.dtype,
+        )  # fp16/fp32
+
+        if self.quantize_output:
+            qoutput = static_per_tensor_quantize(output, self.output_scale)  # fp16/fp32 output
+            output = qoutput.to(output.dtype) * self.output_scale
+
+        return output  # fp16/fp32
