@@ -1,5 +1,6 @@
 import copy
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Optional
@@ -11,6 +12,7 @@ import transformers
 from tqdm import tqdm
 
 from quant.nn_models.modules.linear import get_concrete_linear_module
+from quant.nn_models.modules.linear.linear_fp8 import FP8StaticLinearQuantizer
 from quant.utils.common_utils import (
     append_str_prefix,
     clear_memory,
@@ -20,10 +22,28 @@ from quant.utils.common_utils import (
     get_op_name,
     set_op_by_name,
 )
+from quant.utils.awq_clib_utils import get_calib_dataset
 from quant.quantization.base.quantizer import BaseQuantizer
 
 
 logger = logging.getLogger(__name__)
+
+
+def replace_module(module, name, new_module):
+    set_op_by_name(module, name, new_module)
+
+
+def prepare_calib_tokens(tokenizer, device, max_calib_samples, max_calib_seq_len, calib_data="pileval"):
+    calib_samples = get_calib_dataset(
+        data=calib_data,
+        tokenizer=tokenizer,
+        n_samples=max_calib_samples,
+        max_seq_len=max_calib_seq_len,
+        split="validation",
+    )
+    if len(calib_samples) == 0:
+        return torch.empty((0, max_calib_seq_len), dtype=torch.long, device=device)
+    return torch.cat(calib_samples, dim=0).to(device)
 
 
 class Fp8Quantizer(BaseQuantizer):
@@ -86,12 +106,6 @@ class Fp8Quantizer(BaseQuantizer):
         quant_config,
         dynamic_quant_linear=None,
     ):
-        """
-        在指定设备上量化单层。
-
-        这里先把截图里的接口骨架补齐，后续再继续补实际的
-        calibration、replace 以及 pack 流程。
-        """
         if dynamic_quant_linear is None:
             dynamic_quant_linear = self.dynamic_quant_linear
 
@@ -106,19 +120,137 @@ class Fp8Quantizer(BaseQuantizer):
             named_linears, self.modules_to_not_convert
         )
 
-        logger.info("Preparing fp8 quantization on %s", target_device)
-        return {
-            "layer": layer,
-            "device": target_device,
-            "named_linears": named_linears,
-            "quant_config": quant_config,
-            "dynamic_quant_linear": dynamic_quant_linear,
-        }
+        logger.info("FP8 quantizing one layer on %s", target_device)
+        for name, linear in named_linears.items():
+            if (
+                not isinstance(linear, torch.nn.Linear)
+                or name in quant_config.modules_to_not_convert
+            ):
+                print("=== skipping ", name)
+                continue
+            print("=== Dynamic Quantizing ", name)
+            q_linear = dynamic_quant_linear.from_linear(
+                linear, per_tensor=quant_config.per_tensor_quant
+            )
+            replace_module(layer, name, q_linear)
+            del linear
+
+        layer = layer.cpu()
+        clear_memory()
+        return layer
+
+    def quantize_layer_on_device_thread_safe(
+        self,
+        layer,
+        device_idx,
+        quant_config,
+        dynamic_quant_linear=None,
+    ):
+        """线程安全的量化函数"""
+        try:
+            # 关键：在每个线程中明确设置CUDA设备
+            torch.cuda.set_device(device_idx)
+
+            # 将layer数据移动到对应的GPU
+            layer = layer.to(f"cuda:{device_idx}")
+
+            named_modules = get_named_linears(layer)
+
+            for name, linear in named_modules.items():
+                if (
+                    not isinstance(linear, torch.nn.Linear)
+                    or name in quant_config.modules_to_not_convert
+                ):
+                    print(f"=== Device {device_idx}: skipping {name}")
+                    continue
+
+                print(f"=== Device {device_idx}: Dynamic Quantizing {name}")
+
+                q_linear = dynamic_quant_linear.from_linear(
+                    linear,
+                    per_tensor=quant_config.per_tensor_quant
+                )
+
+                replace_module(layer, name, q_linear)
+                del linear.weight
+                del linear.bias
+                del linear
+
+            # 量化完成后移回CPU
+            layer.cpu()
+            clear_memory()
+            return layer
+        except Exception as e:
+            print(f"[error] device {device_idx} quantization failed: {e}")
+            raise
 
     # 修改主循环部分
     def parallel_quantize_layers(self):
-        """TODO: implement parallel layer quantization."""
-        pass
+        """使用线程池进行多卡并行量化"""
+        layers = self.modelforCausalLM.get_model_layers(self.model)
+        num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        num_layers = len(layers)
+
+        # 准备参数：每个layer分配到不同的设备
+        tasks = []
+        for i, layer in enumerate(layers):
+            device_idx = i % num_devices  # 轮询分配设备
+            tasks.append((layer, device_idx))
+
+        results = [None] * len(tasks)  # 预分配结果列表
+        completed_count = 0
+
+        with ThreadPoolExecutor(max_workers=num_devices) as executor:
+            # 提交所有任务
+            future_to_index = {
+                executor.submit(
+                    self.quantize_layer_on_device_thread_safe,
+                    layer,
+                    device_idx,
+                    self.quant_config,
+                    self.dynamic_quant_linear,
+                ): i
+                for i, (layer, device_idx) in enumerate(tasks)
+            }
+
+            # 使用tqdm显示进度
+            with tqdm(total=len(tasks), desc="FP8 Quantizing weights in parallel") as pbar:
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    try:
+                        result = future.result()
+                        results[index] = result
+                        completed_count += 1
+                    except Exception as e:
+                        print(f"Error quantizing layer {index}: {e}")
+                        results[index] = None
+                    finally:
+                        pbar.update(1)
+                        pbar.set_postfix(completed=f"{completed_count}/{len(tasks)}")
+
+        for i, layer in enumerate(results):
+            if layer is not None:
+                layers[i] = layer
+
+        calib_tokens = prepare_calib_tokens(
+            self.tokenizer,
+            self.device,
+            self.max_calib_samples,
+            self.max_calib_seq_len,
+            calib_data=self.calib_data,
+        )
+
+        # 静态量化
+        if self.quant_config.per_tensor_quant and (
+            self.quant_method == "fp8_static_quant"
+        ):
+            self._apply_quant_act(self.quant_config, calib_tokens)
+        else:
+            print(
+                "[info] skip static quant, since per_tensor=False or quant method is not fp8_static_quant"
+            )
+        clear_memory()
+        return results
 
     # fake multi-gpu quantize
     def quantize(self):
@@ -246,7 +378,7 @@ class Fp8Quantizer(BaseQuantizer):
             # Assumes that list is ordered such that [layer0.k_proj, layer0.v_proj, layer1.k_proj, layer1.v_proj, ...]
             # so we make a list of tuples [(layer0.k_proj, layer0.v_proj), (layer1.k_proj, layer1.v_proj), ...]
             kv_proj_pairs = zip(*[iter(quant_config.kv_cache_quant_layers)] * 2)
-            
+
             for k_proj_name, v_proj_name in kv_proj_pairs:
                 parent_module_name = ".".join(k_proj_name.split(".")[:-1])
                 assert parent_module_name == ".".join(v_proj_name.split(".")[:-1])
