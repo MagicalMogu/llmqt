@@ -194,3 +194,59 @@ class FP8DynamicLinear(LinearBase):
             out_dtype=x.dtype,
         )
         return output
+
+
+# used in calib
+# Module responsible for taking already quantized weights, and recording input scales
+class FP8StaticLinearQuantizer(torch.nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        qdtype,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.nn.Parameter,
+        quantize_output: bool = False,
+    ):
+        super().__init__()
+        # 无需用 Parameter
+        # 因为这个类的目的是在 calibration 过程中记录 activation scale，权重不更新
+        self.qweight = weight  # torch.nn.Parameter(weight, requires_grad=False)
+        self.qdtype = qdtype
+        self.weight_scale = weight_scale  # torch.nn.Parameter(weight_scale, requires_grad=False)
+        self.in_features = in_features
+        self.out_features = out_features
+        if bias is not None:
+            self.bias = bias  # torch.nn.Parameter(bias, requires_grad=False)
+        else:
+            self.bias = None
+        # 保存 calibration 得到的 act input scale
+        self.input_scale = None
+        # 保存 calibration 得到的 kv scale
+        self.output_scale = None
+        self.quantize_output = quantize_output
+
+    def forward(self, x):
+        # 1. 拿到输入的 activation scale，x 是 fp16
+        qinput, x_input_scale = per_tensor_quantize(x)  # observer
+        # 把 calib 采样而得的 input scale 保存起来，为该类的数据成员
+        self.input_scale = x_input_scale
+        qweight = self.qweight.to(self.qdtype)
+        qinput = qinput.to(self.qdtype)
+        output = fp8_gemm(
+            A=qinput,  # fp8
+            A_scale=self.input_scale,
+            B=qweight,  # fp8
+            B_scale=self.weight_scale,
+            bias=self.bias,
+            out_dtype=x.dtype,  # bf16
+        )
+
+        # Optionally, quantize output and record scale
+        if self.quantize_output:  # observer
+            qoutput, output_scale = per_tensor_quantize(output)
+            # 2 拿到output scale，保存起来
+            self.output_scale = output_scale
+            output = qoutput.to(output.dtype) * output_scale
+        return output  # fp16

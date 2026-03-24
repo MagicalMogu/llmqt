@@ -179,5 +179,65 @@ class Fp8Quantizer(BaseQuantizer):
             clear_memory()
 
     def _apply_quant_act(self, quant_config, calib_tokens):
-        """TODO: implement activation-side quantization helpers."""
-        pass
+        # 1 准备calibration
+        # Replace weight quantizer with a dynamic activation quantizer observer
+        for name, dynamic_quant_linear in self.model.named_modules():
+            if (
+                not isinstance(dynamic_quant_linear, self.dynamic_quant_linear)
+                or name in quant_config.modules_to_not_convert
+            ):
+                continue
+            quantizer = FP8StaticLinearQuantizer(
+                in_features=dynamic_quant_linear.in_features,
+                out_features=dynamic_quant_linear.out_features,
+                qdtype=dynamic_quant_linear.qdtype,
+                weight=dynamic_quant_linear.weight,
+                weight_scale=dynamic_quant_linear.weight_scale,
+                bias=dynamic_quant_linear.bias,
+                quantize_output=(
+                    hasattr(quant_config, "kv_cache_quant_layers")
+                    and name in quant_config.kv_cache_quant_layers
+                ),
+            )
+            replace_module(self.model, name, quantizer)
+
+        #2  calibration，也就是用数据跑一边前向
+        # Pass through calibration data to measure activation scales
+        self.model.to(self.device)
+        with torch.inference_mode():
+            with tqdm(
+                total=calib_tokens.shape[0], desc="Calibrating activation scales"
+            ) as pbar:
+                for row_idx in range(calib_tokens.shape[0]):
+                    self.model(calib_tokens[row_idx].reshape(1, -1))
+                    clear_memory()
+                    pbar.update(1)
+
+        # 3.用真正的FP8StaticLinear替换掉FP8StaticLinearQuantizer
+        # 也就是求到scale后，现在完成静态量化，把权重和激活的scale固化在一起
+        static_quant_linear = get_concrete_linear_module("fp8_static_quant")
+        # Replace dynamic quantizer observer with StaticLinear for export
+        for name, quantizer in self.model.named_modules():
+            if (
+                not isinstance(quantizer, FP8StaticLinearQuantizer)
+                or name in quant_config.modules_to_not_convert
+            ):
+                print("=== skipping ", name)
+                continue
+            print("=== static Quantizing ", name)
+            static_proj = static_quant_linear.from_linear(
+                in_features=quantizer.in_features,
+                out_features=quantizer.out_features,
+                fp8_weight=quantizer.qweight,
+                input_scale=quantizer.input_scale,
+                weight_scales=quantizer.weight_scale,
+                bias=quantizer.bias,
+                output_scale=quantizer.output_scale,
+                quantize_output=(
+                    hasattr(quant_config, "kv_cache_quant_layers")
+                    and name in quant_config.kv_cache_quant_layers
+                ),
+            )
+            replace_module(self.model, name, static_proj)
+            del quantizer
+        clear_memory()
