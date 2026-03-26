@@ -36,7 +36,7 @@ class QuantConfig:
     def from_pretrained(cls, save_dir, **kwargs):
         config_path = os.path.join(save_dir, cls.config_file_name)
         with open(config_path, "r") as f:
-            config_dict = json.load(f.read())
+            config_dict = json.load(f)
         
         quant_config = config_dict.get("quantization_config")
         

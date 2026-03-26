@@ -12,7 +12,7 @@ def scale_fc_fc(fc1: nn.Linear, fc2: nn.Linear, scales: torch.Tensor):
     assert isinstance(fc1, nn.Linear) 
     assert isinstance(fc2, nn.Linear)
 
-    scales = scales.to(fc1.weight.device)
+    scales = scales.to(fc1.weight.device).view(-1)
     # prev op 提前div scales，数学上等价于activation / scales
     # 只改 fc1 的“最后若干个输出通道”
     # 因为 y = W1 X + b1
@@ -27,7 +27,7 @@ def scale_fc_fc(fc1: nn.Linear, fc2: nn.Linear, scales: torch.Tensor):
     #
     # 这个[-scales.size(0):]是个安全冗余，不够干净，疑似cv的代码
     # 只会在project大投影qkv的时候有用
-    fc1.weight[-scales.size(0):].div_(scales.view(-1, 1))
+    fc1.weight[-scales.numel():].div_(scales.view(-1, 1))
     if fc1.bias is not None:
         fc1.bias.div_(scales)
     # 真正的乘操作
@@ -46,12 +46,12 @@ def scale_fc_fcs(fc: nn.Linear, fcs: list[nn.Linear], scales: torch.Tensor):
         fcs = [fcs]
     assert all(isinstance(next_fc, nn.Linear) for next_fc in fcs)
 
-    scales = scales.to(fc.weight.device)
+    scales = scales.to(fc.weight.device).view(-1)
 
     # 一个前置 Linear 的输出被多个后续 Linear 共同消费时，
     # 先把中间 activation 的 / scales 融到前置 fc，
     # 再把补偿项乘回每个后续 fc 的输入列。
-    fc.weight[-scales.size(0):].div_(scales.view(-1, 1))
+    fc.weight[-scales.numel():].div_(scales.view(-1, 1))
     if fc.bias is not None:
         fc.bias.div_(scales)
 
@@ -70,11 +70,15 @@ def scale_ln_fcs(ln: nn.Module, fcs: list[nn.Linear], scales: torch.Tensor):
     if not isinstance(fcs, list):
         fcs = [fcs]
 
-    scales = scales.to(ln.weight.device)
+    scales = scales.to(ln.weight.device).view(-1)
+    gemma_norm_types = tuple(
+        cls for cls in (globals().get("GemmaRMSNorm"), globals().get("Gemma2RMSNorm"))
+        if cls is not None
+    )
 
     # GemmaRMSNorm 的输出缩放是 x * (1 + weight)，
     # 所以要先临时还原成真正参与乘法的那部分参数再做 / scales。
-    if isinstance(ln, GemmaRMSNorm) or isinstance(ln, Gemma2RMSNorm):
+    if gemma_norm_types and isinstance(ln, gemma_norm_types):
         ln.weight += 1
         ln.weight.div_(scales)
         ln.weight -= 1
@@ -100,6 +104,7 @@ def scale_ln_fcs(ln: nn.Module, fcs: list[nn.Linear], scales: torch.Tensor):
 def apply_scale(module, scale_list, input_feat_dict=None):
 
     best_device = next(module.parameters()).device
+    allowed_norms = (nn.LayerNorm,)
 
     for prev_op, layer_names, scales in scale_list:
         # prev_op 和 layer_names 都是字符串，需要转换成实际的模块对象。
@@ -143,7 +148,7 @@ def apply_scale(module, scale_list, input_feat_dict=None):
                 if layer_name in input_feat_dict:
                     inp = input_feat_dict[layer_name]
                     # inp.div_(scales.view(1, -1)).to(inp.device)  这特么写的啥，无意义
-                    inp.div_(scales.view(1, -1))
+                    inp.div_(scales.to(inp.device).view(1, -1))
 
         prev_op.to("cpu")
         for layer in layers:

@@ -1,18 +1,10 @@
-from ast import Dict, mod
-from collections import defaultdict
-from email.policy import default
 import functools
 import inspect
+from collections import defaultdict
 import logging
-from os import name
-from tkinter import W
-from turtle import end_fill
-from xml.dom.minidom import Element
-from click import clear
-from requests import get
-import tqdm
-import tokenize
-from typing import List
+from typing import Dict, List
+
+from tqdm import tqdm
 
 from quant.quantization.awq import scale
 import torch
@@ -68,7 +60,7 @@ class AwqQuantizer(BaseQuantizer):
         self.apply_clip = apply_clip
         self.n_parrallel_calib_sample = n_parrallel_calib_sample
 
-        if self.model.types == "qwen3_moe":
+        if self.model_type == "qwen3_moe":
             self.max_calib_samples = max_calib_samples * 2 # qwen3_moe模型需要更多的校准样本
         else:
             self.max_calib_samples = max_calib_samples
@@ -181,14 +173,16 @@ class AwqQuantizer(BaseQuantizer):
         class Catcher(nn.Module):
             def __init__(self, module):
                 super().__init__()
-                self.module = module
+                self.wrapped_module = module
                 # 继承所有属性，防止触发attribute error
                 for name, value in module.__dict__.items():
+                    if name in {"_modules", "_parameters", "_buffers"}:
+                        continue
                     setattr(self, name, value)
 
             def forward(self, *args, **kwargs):
                 if (len(args) > 0):
-                    hidden_stats = args[0]
+                    hidden_states = args[0]
                     del args
                 else:
                     first_key = list(kwargs.keys())[0]
@@ -206,9 +200,8 @@ class AwqQuantizer(BaseQuantizer):
         except ValueError:
             pass
 
-        print(inps)
         # 还原
-        modules[0] = modules[0].module
+        modules[0] = modules[0].wrapped_module
         # prepare_inputs_for_generation是transformers里生成文本时准备输入的函数
         # 输入samples，根据当前的状态动态地准备好下一步生成文本需要的输入, 比如input_ids, attention_mask等 
         # 把捕获到的inputs和layer_kwargs准备好, 以便后续量化过程中使用
@@ -653,12 +646,12 @@ class AwqQuantizer(BaseQuantizer):
         
         if self.zero_point:
             # 1. 非对称量化
-             max_val = w.amax(dim=0, keepdim=True)
-             min_val = w.amin(dim=0, keepdim=True)
+             max_val = w.amax(dim=1, keepdim=True)
+             min_val = w.amin(dim=1, keepdim=True)
              max_int = 2 ** self.w_bits - 1
              min_int = 0
              scales = (max_val - min_val).clamp(min=1e-5) / max_int
-             zeros = (-torch.roud(min_val / scales)).clamp(min=min_int, max=max_int)
+             zeros = (-torch.round(min_val / scales)).clamp(min=min_int, max=max_int)
              w = (
                  torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
              ) * scales
@@ -669,7 +662,7 @@ class AwqQuantizer(BaseQuantizer):
             # int4的公式
             # scale = absmax / 2^4-1, zp = 0
             # qx = clip(round(x/scale), -8, 7)
-            max_val = w.abs().amax(dim=0, keepdim=True).clamp(min=1e-5)
+            max_val = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-5)
             max_int = 2 ** (self.w_bits - 1) - 1
             min_int = -2 ** (self.w_bits - 1)
             # 实际会把值映射到 -7,7

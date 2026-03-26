@@ -1,16 +1,6 @@
-from ast import Not
-
-from quant.quantization import awq
 import torch
-import warnings
 import torch.nn as nn
-from torch.autograd import Function
-from quant.utils.common_utils import (
-        get_best_device
-)
 from quant.utils.packing_utils import (
-    pack_4bit_weights,
-    pack_8bit_weights,
     dequantize_gemm,
 )
 

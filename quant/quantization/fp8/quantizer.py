@@ -186,10 +186,9 @@ class Fp8Quantizer(BaseQuantizer):
 
     # 修改主循环部分
     def parallel_quantize_layers(self):
-        """使用线程池进行多卡并行量化"""
+        """使用线程池进行多卡并行量化，只处理 weight quant。"""
         layers = self.modelforCausalLM.get_model_layers(self.model)
         num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
-        num_layers = len(layers)
 
         # 准备参数：每个layer分配到不同的设备
         tasks = []
@@ -232,24 +231,6 @@ class Fp8Quantizer(BaseQuantizer):
             if layer is not None:
                 layers[i] = layer
 
-        calib_tokens = prepare_calib_tokens(
-            self.tokenizer,
-            self.device,
-            self.max_calib_samples,
-            self.max_calib_seq_len,
-            calib_data=self.calib_data,
-        )
-
-        # 静态量化
-        if self.quant_config.per_tensor_quant and (
-            self.quant_method == "fp8_static_quant"
-        ):
-            self._apply_quant_act(self.quant_config, calib_tokens)
-        else:
-            print(
-                "[info] skip static quant, since per_tensor=False or quant method is not fp8_static_quant"
-            )
-        clear_memory()
         return results
 
     # fake multi-gpu quantize
@@ -258,12 +239,6 @@ class Fp8Quantizer(BaseQuantizer):
             self.parallel_quantize_layers()
         else:
             layers = self.modelforCausalLM.get_model_layers(self.model)
-            calib_tokens = prepare_calib_tokens(
-                self.tokenizer,
-                self.device,
-                self.max_calib_samples,
-                self.max_calib_seq_len,
-            )
             for i in tqdm(range(len(layers)), desc="FP8 Quantizing weights"):
                 # 获取当前layer该被分到哪个device
                 common_device = next(layers[i].parameters()).device
@@ -298,17 +273,24 @@ class Fp8Quantizer(BaseQuantizer):
                     del linear
                 layers[i].cpu()
                 clear_memory()
-            
-            # 静态量化
-            if self.quant_config.per_tensor_quant and (
-                self.quant_method == "fp8_static_quant"
-            ):
-                self._apply_quant_act(self.quant_config, calib_tokens)
-            else:
-                print(
-                    "[info] skip static quant, since per_tensor=False or quant method is not fp8_static_quant"
-                )
-            clear_memory()
+
+        calib_tokens = prepare_calib_tokens(
+            self.tokenizer,
+            self.device,
+            self.max_calib_samples,
+            self.max_calib_seq_len,
+            calib_data=self.calib_data,
+        )
+
+        if self.quant_config.per_tensor_quant and (
+            self.quant_method == "fp8_static_quant"
+        ):
+            self._apply_quant_act(self.quant_config, calib_tokens)
+        else:
+            print(
+                "[info] skip static quant, since per_tensor=False or quant method is not fp8_static_quant"
+            )
+        clear_memory()
 
     def _apply_quant_act(self, quant_config, calib_tokens):
         # 1 准备calibration

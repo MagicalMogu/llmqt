@@ -1,0 +1,13 @@
+torch
+transformers # 如果 transformers 版本不兼容，可优先尝试固定到 4.46.0
+accelerate
+datasets # 如遇依赖冲突，可单独执行: pip install datasets==3.6.0 --no-deps
+huggingface_hub
+safetensors
+tqdm
+numpy
+zstandard
+multiprocess
+xxhash
+requests
+click

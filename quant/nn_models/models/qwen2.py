@@ -87,3 +87,7 @@ class Qwen2MOdelForCausalLM(BaseModelForCausalLM):
         )
 
         return layers
+
+
+# Keep a correctly-cased export for import sites.
+Qwen2ModelForCausalLM = Qwen2MOdelForCausalLM

@@ -1,12 +1,7 @@
-from ast import Not
-from io import text_encoding
-from pydoc import text
-from random import sample
-from tkinter import N
-
-import torch 
 import logging
 from typing import List, Union
+
+import torch
 from datasets import load_dataset
 
 def get_calib_dataset(
@@ -21,7 +16,7 @@ def get_calib_dataset(
     if isinstance(data, str):
         if data == "pileval":
             # pileval数据集是一个文本数据集，包含了各种文本数据的子集，比如c4、wikitext2等，可以用来做校准
-            dataset = load_dataset("mit-han-lab/pileval", split="validation")
+            dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
         else:
             dataset = load_dataset(data, split=split)
         # shuffle数据集，设置随机种子为42，保证每次运行结果一致
@@ -40,7 +35,7 @@ def get_calib_dataset(
     samples = []
     n_run = 0
     for data in dataset:
-        if isinstance(data, List):
+        if isinstance(data, list):
             line_encoder = data
         else:
             line = data[text_column]

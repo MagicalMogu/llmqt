@@ -3,7 +3,7 @@ import os
 import torch
 from torch import nn
 import transformers
-from transformers import PretrainedModel, PretrainedConfig, AutoConfig
+from transformers import PreTrainedModel, PretrainedConfig, AutoConfig
 from huggingface_hub import snapshot_download, save_torch_state_dict
 from .config import QuantConfig
 from quant.quantization import get_concrete_quantizer_cls
@@ -20,21 +20,34 @@ class BaseModelForCausalLM(nn.Module):
                  config, # config of model
                  quant_config):
         super().__init__()
-        self.model: PretrainedModel = model
+        self.model: PreTrainedModel = model
         self.model_type: str = model_type
         self.isquantized: bool = is_quantized
         self.config: PretrainedConfig = config
         self.quant_config: QuantConfig = quant_config
 
     @classmethod
-    def _load_config(cls, model_path):
-        # 1. download model if path is not a dir
-        model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
+    def _load_config(cls, model_path, trust_remote_code=True, **model_init_kwargs):
+        if os.path.isdir(model_path):
+            resolved_model_path = model_path
+        else:
+            resolved_model_path = snapshot_download(model_path)
 
-        quant_config = QuantConfig.from_pretrained(model_path)
-        config = AutoConfig.from_pretrained(model_path)
+        config = AutoConfig.from_pretrained(
+            resolved_model_path,
+            trust_remote_code=trust_remote_code,
+            **model_init_kwargs,
+        )
 
-        return model_path, config, quant_config
+        quant_config_path = os.path.join(
+            resolved_model_path, QuantConfig.config_file_name
+        )
+        if os.path.exists(quant_config_path):
+            quant_config = QuantConfig.from_pretrained(resolved_model_path)
+        else:
+            quant_config = QuantConfig()
+
+        return resolved_model_path, config, quant_config
 
     @classmethod
     def from_pretrained(cls,
@@ -49,7 +62,9 @@ class BaseModelForCausalLM(nn.Module):
     ):
 
         model_weights_path, config, quant_config = cls._load_config(
-            cls, model_path, "", safetensors, trust_remote_code=trust_remote_code, **model_init_kwargs
+            model_path,
+            trust_remote_code=trust_remote_code,
+            **model_init_kwargs,
         )
         target_cls_name = TRANSFORMERS_AUTO_MAPPING_DICT[config.model_type]
         target_cls = getattr(transformers, target_cls_name)
@@ -98,9 +113,22 @@ class BaseModelForCausalLM(nn.Module):
         self.quantizer = quantizer_cls(
             self,
             self.model,
+            self.model_type,
+            tokenizer,
             self.quant_config,
-            tokenizer=tokenizer,
-            calib_data=calib_data,
+            self.quant_config.quant_method,
+            self.quant_config.w_bit,
+            self.quant_config.q_group_size,
+            self.quant_config.zero_point,
+            calib_data,
+            duo_scaling,
+            self.quant_config.modules_to_not_convert,
+            fake_quant,
+            apply_clip,
+            n_parrallel_sample,
+            max_calib_samples,
+            max_calib_seq_len,
+            max_chunk_memory,
         )
         self.quantizer.quantize()
         self.isquantized = True

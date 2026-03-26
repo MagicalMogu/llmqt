@@ -1,1 +1,19 @@
 __pycache__/
+*.py[cod]
+
+# Local Python environments
+.venv/
+.venv_old/
+
+# Packaging/build artifacts
+*.egg-info/
+build/
+dist/
+
+# Local model outputs
+quant/examples/Qwen2.5-0.5B-Instruct-awq/
+quant/examples/Qwen2.5-0.5B-Instruct-fp8-static/
+quant/examples/Qwen2.5-0.5B-Instruct-sq/
+
+# OS/editor noise
+.DS_Store
